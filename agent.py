@@ -5,28 +5,20 @@ Reads a GitHub repo and answers natural-language questions about its architectur
 Usage:
     python agent.py --repo owner/repo --question "What does this repo do?"
     python agent.py --repo fastapi/fastapi --question "How is routing implemented?"
-
-Rules:
-    - No LangChain / LangGraph — pure agent loop from scratch
-    - Max 15 iterations
-    - Files > 100 KB refused
-    - Tool output capped at 8 KB
-    - Every tool call logged with arguments
 """
 import argparse
 import json
 import os
 import sys
-import time
 import urllib.request
 import urllib.error
+import urllib.parse
 from datetime import datetime
 from typing import Optional
 
 from tools import TOOLS, TOOL_SCHEMAS
 
 MAX_ITERATIONS = 15
-MODEL          = "gemini-2.0-flash"
 API_KEY_ENV    = "GEMINI_API_KEY"
 
 SYSTEM_PROMPT = """You are a Coding Research Agent. Your job is to answer questions about GitHub repositories by exploring their code.
@@ -46,99 +38,70 @@ Strategy:
 5. Synthesize findings into a clear answer
 
 Rules:
-- Never read files > 100 KB (the tool will refuse anyway)
-- Always explore before answering — don't guess
+- Never read files > 100 KB
+- Always explore before answering
 - Cite specific files when making claims
-- If you cannot find the answer after thorough exploration, say so honestly
-- When you have enough information, provide your FINAL ANSWER clearly"""
+- When you have enough information, provide your FINAL ANSWER"""
 
 
-def _gemini_request(api_key: str, messages: list, tools: list) -> dict:
-    """Call Gemini API with tool support."""
-    
-    # Convert to Gemini format
-    gemini_tools = [{
-        "function_declarations": [
-            {
-                "name"       : t["name"],
-                "description": t["description"],
-                "parameters" : {
-                    "type"      : "object",
-                    "properties": {k: {"type": v.get("type", "string"), 
-                                       "description": v.get("description", "")}
-                                   for k, v in t["parameters"].items()},
-                    "required"  : t.get("required", [])
-                }
-            }
-            for t in tools
-        ]
-    }]
+def _call_gemini(api_key: str, conversation: list) -> tuple[str, list]:
+    """Call Gemini API using google-generativeai library."""
+    import google.generativeai as genai
 
-    # Convert messages to Gemini format
-    gemini_messages = []
-    for msg in messages:
-        role = "user" if msg["role"] == "user" else "model"
-        if isinstance(msg["content"], str):
-            gemini_messages.append({
-                "role"  : role,
-                "parts" : [{"text": msg["content"]}]
-            })
-        elif isinstance(msg["content"], list):
-            parts = []
-            for part in msg["content"]:
-                if part.get("type") == "text":
-                    parts.append({"text": part["text"]})
-                elif part.get("type") == "tool_use":
-                    parts.append({
-                        "functionCall": {
-                            "name": part["name"],
-                            "args": part["input"]
-                        }
-                    })
-                elif part.get("type") == "tool_result":
-                    parts.append({
-                        "functionResponse": {
-                            "name"    : part.get("tool_use_id", "tool"),
-                            "response": {"result": part["content"]}
-                        }
-                    })
-            gemini_messages.append({"role": role, "parts": parts})
+    genai.configure(api_key=api_key)
 
-    payload = json.dumps({
-        "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
-        "contents"          : gemini_messages,
-        "tools"             : gemini_tools,
-        "generationConfig"  : {"temperature": 0.1, "maxOutputTokens": 2048}
-    }).encode()
+    # Build tools for Gemini
+    tools = []
+    for schema in TOOL_SCHEMAS:
+        props = {}
+        for param_name, param_info in schema["parameters"].items():
+            props[param_name] = genai.protos.Schema(
+                type=genai.protos.Type[param_info.get("type", "string").upper()],
+                description=param_info.get("description", "")
+            )
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent?key={api_key}"
-    req = urllib.request.Request(
-        url, data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST"
+        func_decl = genai.protos.FunctionDeclaration(
+            name=schema["name"],
+            description=schema["description"],
+            parameters=genai.protos.Schema(
+                type=genai.protos.Type.OBJECT,
+                properties=props,
+                required=schema.get("required", [])
+            )
+        )
+        tools.append(func_decl)
+
+    model = genai.GenerativeModel(
+        model_name="gemini-2.0-flash",
+        system_instruction=SYSTEM_PROMPT,
+        tools=[genai.protos.Tool(function_declarations=tools)]
     )
 
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        return json.loads(resp.read())
+    # Convert conversation to Gemini format
+    gemini_history = []
+    for msg in conversation[:-1]:
+        gemini_history.append({
+            "role" : "user" if msg["role"] == "user" else "model",
+            "parts": [msg["content"]] if isinstance(msg["content"], str) else msg["content"]
+        })
 
+    chat    = model.start_chat(history=gemini_history)
+    last    = conversation[-1]
+    content = last["content"] if isinstance(last["content"], str) else last["content"]
+    response = chat.send_message(content)
 
-def _parse_gemini_response(response: dict) -> tuple[str, list]:
-    """Parse Gemini response into (text, tool_calls)."""
-    candidate = response.get("candidates", [{}])[0]
-    content   = candidate.get("content", {})
-    parts     = content.get("parts", [])
-
+    # Parse response
     text       = ""
     tool_calls = []
 
-    for part in parts:
-        if "text" in part:
-            text += part["text"]
-        if "functionCall" in part:
-            fc = part["functionCall"]
+    for part in response.parts:
+        if hasattr(part, "text") and part.text:
+            text += part.text
+        if hasattr(part, "function_call") and part.function_call.name:
+            fc = part.function_call
             tool_calls.append({
-                "name" : fc["name"],
-                "args" : fc.get("args", {})
+                "name": fc.name,
+                "args": dict(fc.args)
             })
 
     return text.strip(), tool_calls
@@ -163,10 +126,6 @@ def _execute_tool(tool_name: str, args: dict, iteration: int) -> str:
             return f"Tool error: {error}"
         print(f"     ✅ Success ({len(result)} chars)")
         return result
-    except TypeError as e:
-        err = f"Invalid arguments for {tool_name}: {e}"
-        print(f"     ❌ {err}")
-        return err
     except Exception as e:
         err = f"Tool execution failed: {e}"
         print(f"     ❌ {err}")
@@ -174,16 +133,10 @@ def _execute_tool(tool_name: str, args: dict, iteration: int) -> str:
 
 
 def run_agent(repo: str, question: str, api_key: str) -> str:
-    """
-    Main agent loop.
-    - Max 15 iterations
-    - Logs every tool call
-    - Returns final answer
-    """
-    # Parse owner/repo
+    """Main agent loop."""
     parts = repo.strip("/").split("/")
     if len(parts) != 2:
-        return f"Invalid repo format '{repo}'. Use 'owner/repo' e.g. 'fastapi/fastapi'"
+        return f"Invalid repo format '{repo}'. Use 'owner/repo'"
     owner, repo_name = parts
 
     print(f"\n{'='*60}")
@@ -193,10 +146,9 @@ def run_agent(repo: str, question: str, api_key: str) -> str:
     print(f"❓ Question : {question}")
     print(f"{'='*60}")
 
-    # Initial user message
-    messages = [{
+    conversation = [{
         "role"   : "user",
-        "content": f"Repo: {owner}/{repo_name}\n\nQuestion: {question}\n\nPlease research this repo and answer the question."
+        "content": f"Repo: {owner}/{repo_name}\n\nQuestion: {question}\n\nPlease research this repo thoroughly and answer the question."
     }]
 
     iteration    = 0
@@ -206,60 +158,37 @@ def run_agent(repo: str, question: str, api_key: str) -> str:
         iteration += 1
         print(f"\n📍 Iteration {iteration}/{MAX_ITERATIONS}")
 
-        # Call Gemini
         try:
-            response   = _gemini_request(api_key, messages, TOOL_SCHEMAS)
-            text, tool_calls = _parse_gemini_response(response)
-        except urllib.error.HTTPError as e:
-            error_body = e.read().decode()
-            return f"Gemini API error {e.code}: {error_body}"
+            text, tool_calls = _call_gemini(api_key, conversation)
         except Exception as e:
             return f"API call failed: {e}"
 
-        # Check for final answer
         if text and not tool_calls:
             print(f"\n✅ Agent provided final answer (iteration {iteration})")
             final_answer = text
             break
 
         if text:
-            print(f"   💭 Agent thinking: {text[:150]}...")
+            print(f"   💭 Thinking: {text[:150]}...")
 
-        # Execute tool calls
         if tool_calls:
-            # Add assistant message with tool calls
-            assistant_parts = []
-            if text:
-                assistant_parts.append({"type": "text", "text": text})
-            for tc in tool_calls:
-                assistant_parts.append({
-                    "type" : "tool_use",
-                    "name" : tc["name"],
-                    "input": tc["args"],
-                    "id"   : f"call_{iteration}"
-                })
-            messages.append({"role": "assistant", "content": assistant_parts})
+            # Add assistant turn
+            conversation.append({"role": "model", "content": text or "Using tools..."})
 
-            # Execute each tool and collect results
-            tool_results = []
+            # Execute tools and collect results
+            results_text = ""
             for tc in tool_calls:
                 result = _execute_tool(tc["name"], tc["args"], iteration)
-                tool_results.append({
-                    "type"       : "tool_result",
-                    "tool_use_id": f"call_{iteration}",
-                    "content"    : result
-                })
+                results_text += f"\n[{tc['name']} result]:\n{result}\n"
 
-            # Add tool results as user message
-            messages.append({"role": "user", "content": tool_results})
-
+            # Add tool results as user turn
+            conversation.append({"role": "user", "content": results_text})
         else:
-            # No tool calls, no text — something went wrong
-            print("   ⚠️  No tool calls or text in response")
+            print("   ⚠️  No tool calls or text")
             break
 
     if not final_answer:
-        final_answer = f"Agent reached max iterations ({MAX_ITERATIONS}) without a final answer. Last response: {text}"
+        final_answer = f"Agent reached max iterations ({MAX_ITERATIONS}). Last response: {text}"
 
     print(f"\n{'='*60}")
     print("📋 FINAL ANSWER")
@@ -271,16 +200,7 @@ def run_agent(repo: str, question: str, api_key: str) -> str:
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Coding Research Agent — answers questions about GitHub repos",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python agent.py --repo fastapi/fastapi --question "How is routing implemented?"
-  python agent.py --repo pallets/flask --question "What is the main entry point?"
-  python agent.py --repo psf/requests --question "How does the session handling work?"
-        """
-    )
+    parser = argparse.ArgumentParser(description="Coding Research Agent")
     parser.add_argument("--repo",     required=True, help="GitHub repo in owner/repo format")
     parser.add_argument("--question", required=True, help="Natural language question about the repo")
     parser.add_argument("--api-key",  help="Gemini API key (or set GEMINI_API_KEY env var)")
@@ -288,11 +208,10 @@ Examples:
 
     api_key = args.api_key or os.environ.get(API_KEY_ENV)
     if not api_key:
-        print(f"❌ No API key found. Set {API_KEY_ENV} environment variable or use --api-key")
+        print(f"❌ No API key. Set {API_KEY_ENV} env var or use --api-key")
         sys.exit(1)
 
-    answer = run_agent(args.repo, args.question, api_key)
-    return answer
+    run_agent(args.repo, args.question, api_key)
 
 
 if __name__ == "__main__":
