@@ -1,1 +1,2 @@
-google-genai
+# No external dependencies needed — uses urllib (built-in)
+# groq is called via HTTP directly

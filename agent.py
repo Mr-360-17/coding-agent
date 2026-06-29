@@ -9,12 +9,15 @@ import argparse
 import json
 import os
 import sys
+import urllib.request
+import urllib.error
 from datetime import datetime
 
 from tools import TOOLS, TOOL_SCHEMAS
 
 MAX_ITERATIONS = 15
-API_KEY_ENV    = "GEMINI_API_KEY"
+API_KEY_ENV    = "GROQ_API_KEY"
+MODEL          = "llama-3.3-70b-versatile"
 
 SYSTEM_PROMPT = """You are a Coding Research Agent. Answer questions about GitHub repositories by exploring their code.
 
@@ -30,71 +33,71 @@ Strategy:
 2. Use list_repo_structure on root
 3. Read key files (README, entry points)
 4. Search for specific patterns
-5. Give a clear FINAL ANSWER citing specific files"""
+5. Give a clear FINAL ANSWER citing specific files
+
+When you have enough info, just answer directly without calling any tools."""
 
 
-def _call_gemini(api_key: str, messages: list) -> tuple[str, list]:
-    """Call Gemini API using google-genai library."""
-    from google import genai
-    from google.genai import types
+def _build_tools_prompt() -> str:
+    """Build a text description of tools for the prompt."""
+    lines = ["\nAvailable tools (call them by responding with JSON in this exact format):"]
+    lines.append('{"tool": "tool_name", "args": {"param1": "value1"}}')
+    lines.append("\nTool definitions:")
+    for t in TOOL_SCHEMAS:
+        params = ", ".join(f"{k}: {v.get('type','string')}" 
+                          for k, v in t["parameters"].items())
+        lines.append(f"- {t['name']}({params}): {t['description']}")
+    return "\n".join(lines)
 
-    client = genai.Client(api_key=api_key)
 
-    # Build function declarations
-    func_decls = []
-    for schema in TOOL_SCHEMAS:
-        props = {}
-        for name, info in schema["parameters"].items():
-            t = info.get("type", "string").upper()
-            props[name] = types.Schema(type=t, description=info.get("description", ""))
+def _call_groq(api_key: str, messages: list) -> tuple[str, list]:
+    """Call Groq API and parse response for tool calls or text."""
+    payload = json.dumps({
+        "model"      : MODEL,
+        "messages"   : messages,
+        "temperature": 0.1,
+        "max_tokens" : 2048,
+    }).encode()
 
-        func_decls.append(types.FunctionDeclaration(
-            name=schema["name"],
-            description=schema["description"],
-            parameters=types.Schema(
-                type="OBJECT",
-                properties=props,
-                required=schema.get("required", [])
-            )
-        ))
-
-    tools = [types.Tool(function_declarations=func_decls)]
-    config = types.GenerateContentConfig(
-        system_instruction=SYSTEM_PROMPT,
-        tools=tools,
-        temperature=0.1
+    req = urllib.request.Request(
+        "https://api.groq.com/openai/v1/chat/completions",
+        data=payload,
+        headers={
+            "Content-Type" : "application/json",
+            "Authorization": f"Bearer {api_key}"
+        },
+        method="POST"
     )
 
-    # Convert messages
-    contents = []
-    for msg in messages:
-        role    = "user" if msg["role"] == "user" else "model"
-        content = msg["content"]
-        if isinstance(content, str):
-            contents.append(types.Content(role=role, parts=[types.Part(text=content)]))
-        else:
-            contents.append(types.Content(role=role, parts=[types.Part(text=str(content))]))
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        raise Exception(f"Groq API error {e.code}: {e.read().decode()}")
 
-    response = client.models.generate_content(
-        model="gemini-2.0-flash",
-        contents=contents,
-        config=config
-    )
+    text = data["choices"][0]["message"]["content"] or ""
 
-    text       = ""
+    # Try to extract tool call from JSON in response
     tool_calls = []
+    stripped = text.strip()
 
-    for part in response.candidates[0].content.parts:
-        if hasattr(part, "text") and part.text:
-            text += part.text
-        if hasattr(part, "function_call") and part.function_call:
-            fc = part.function_call
-            tool_calls.append({
-                "name": fc.name,
-                "args": dict(fc.args) if fc.args else {}
-            })
+    # Look for JSON tool call
+    if stripped.startswith("{") and '"tool"' in stripped:
+        try:
+            # Extract just the JSON part
+            end = stripped.find("}") + 1
+            json_str = stripped[:end]
+            parsed = json.loads(json_str)
+            if "tool" in parsed and "args" in parsed:
+                tool_calls.append({
+                    "name": parsed["tool"],
+                    "args": parsed["args"]
+                })
+                text = stripped[end:].strip()
+        except json.JSONDecodeError:
+            pass
 
-    return text.strip(), tool_calls
+    return text, tool_calls
 
 
 def _execute_tool(tool_name: str, args: dict, iteration: int) -> str:
@@ -133,10 +136,18 @@ def run_agent(repo: str, question: str, api_key: str) -> str:
     print(f"❓ Question : {question}")
     print(f"{'='*60}")
 
-    messages = [{
-        "role"   : "user",
-        "content": f"Repo: {owner}/{repo_name}\n\nQuestion: {question}\n\nResearch this repo and answer the question."
-    }]
+    tools_prompt = _build_tools_prompt()
+
+    messages = [
+        {
+            "role"   : "system",
+            "content": SYSTEM_PROMPT + tools_prompt
+        },
+        {
+            "role"   : "user",
+            "content": f"Repo: {owner}/{repo_name}\n\nQuestion: {question}\n\nStart by calling get_repo_info, then explore and answer."
+        }
+    ]
 
     iteration    = 0
     final_answer = None
@@ -147,7 +158,7 @@ def run_agent(repo: str, question: str, api_key: str) -> str:
         print(f"\n📍 Iteration {iteration}/{MAX_ITERATIONS}")
 
         try:
-            text, tool_calls = _call_gemini(api_key, messages)
+            text, tool_calls = _call_groq(api_key, messages)
         except Exception as e:
             return f"API error: {e}"
 
@@ -161,13 +172,12 @@ def run_agent(repo: str, question: str, api_key: str) -> str:
             print(f"   💭 {text[:120]}...")
 
         if tool_calls:
-            messages.append({"role": "model", "content": text or "Calling tools..."})
-            results = ""
-            for tc in tool_calls:
-                result = _execute_tool(tc["name"], tc["args"], iteration)
-                results += f"\n[{tc['name']}]:\n{result}\n"
-            messages.append({"role": "user", "content": results})
+            messages.append({"role": "assistant", "content": json.dumps({"tool": tool_calls[0]["name"], "args": tool_calls[0]["args"]})})
+            result = _execute_tool(tool_calls[0]["name"], tool_calls[0]["args"], iteration)
+            messages.append({"role": "user", "content": f"Tool result:\n{result}\n\nContinue researching or provide your final answer."})
         else:
+            if text:
+                final_answer = text
             break
 
     if not final_answer:
